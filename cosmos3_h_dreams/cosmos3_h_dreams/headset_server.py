@@ -160,9 +160,22 @@ class HeadsetServer:
         deadline_pacing: bool = False,
         gpu_frame_conversion: bool = False,
         dedicated_inference_thread: bool = False,
+        generation_lead_ms: float = 0.0,
         scenes: dict[str, Cosmos3HDreamsConfig] | None = None,
         scene_labels: dict[str, str] | None = None,
     ) -> None:
+        if not math.isfinite(generation_lead_ms) or generation_lead_ms < 0:
+            raise ValueError("generation_lead_ms must be finite and nonnegative")
+        if generation_lead_ms and not (overlap_playback and deadline_pacing):
+            raise ValueError("generation_lead_ms requires overlapping deadline pacing")
+        self.defer_cache_refresh = bool(
+            getattr(getattr(session, "config", None), "defer_cache_refresh", False)
+        )
+        if self.defer_cache_refresh and not dedicated_inference_thread:
+            raise ValueError("defer_cache_refresh requires dedicated_inference_thread=True")
+        self.generation_lead_ms = generation_lead_ms
+        self._next_block_due_s: float | None = None
+        self._generation_wakeup = asyncio.Event()
         self.scenes = scenes or {}
         self.scene_labels = scene_labels or {}
         self.active_scene = next(iter(self.scenes), None)
@@ -179,6 +192,7 @@ class HeadsetServer:
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="dreams-inference")
             if dedicated_inference_thread else None
         )
+        self._cache_refresh_future: asyncio.Future | None = None
         self._last_publish_s: float | None = None
         self._jpeg: bytes | None = None
         self._jpeg_version = 0
@@ -212,12 +226,45 @@ class HeadsetServer:
 
     async def _run_inference(self, function, *args, **kwargs):
         """Keep GPU initialization and execution on the same optional worker."""
+        await self._wait_for_cache_refresh()
+        return await self._run_on_inference_thread(function, *args, **kwargs)
+
+    async def _run_on_inference_thread(self, function, *args, **kwargs):
+        """Execute on the owner, including cleanup after a failed refresh."""
         if self._inference_executor is None:
             return await asyncio.to_thread(function, *args, **kwargs)
         context = contextvars.copy_context()
         return await asyncio.get_running_loop().run_in_executor(
             self._inference_executor, functools.partial(context.run, function, *args, **kwargs)
         )
+
+    def _queue_cache_refresh(self) -> None:
+        """Queue maintenance after RGB preparation without blocking playback."""
+        if self._cache_refresh_future is not None or self._inference_executor is None:
+            raise RuntimeError("Deferred refresh requires an idle dedicated inference queue")
+        context = contextvars.copy_context()
+        self._cache_refresh_future = asyncio.get_running_loop().run_in_executor(
+            self._inference_executor,
+            functools.partial(context.run, self.session.submit_pending_cache_update),
+        )
+
+    async def _wait_for_cache_refresh(self) -> None:
+        """Join maintenance and preserve it when an asyncio waiter is cancelled."""
+        pending = self._cache_refresh_future
+        if pending is not None:
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                # Even a completed future may carry an error this cancelled
+                # waiter did not observe. Leave it for the next call/cleanup.
+                raise
+            except BaseException:
+                if self._cache_refresh_future is pending:
+                    self._cache_refresh_future = None
+                raise
+            else:
+                if self._cache_refresh_future is pending:
+                    self._cache_refresh_future = None
 
     async def close(self) -> None:
         """Stop controller sampling, video delivery, and the model session."""
@@ -240,7 +287,11 @@ class HeadsetServer:
         try:
             # Queue cleanup behind an in-flight step even if its asyncio waiter
             # was cancelled; cancelling that waiter cannot stop its GPU thread.
-            await self._run_inference(self.session.close)
+            try:
+                await self._wait_for_cache_refresh()
+            finally:
+                # A refresh exception must not skip model/decoder cleanup.
+                await self._run_on_inference_thread(self.session.close)
         finally:
             if self._inference_executor is not None:
                 self._inference_executor.shutdown(wait=True)
@@ -249,6 +300,8 @@ class HeadsetServer:
         """Clear the current MJPEG image and invalidate in-flight playback."""
         self._ready.clear()
         self._last_publish_s = None
+        self._next_block_due_s = None
+        self._generation_wakeup.set()
         async with self._jpeg_changed:
             self._jpeg = None
             self._jpeg_version += 1
@@ -270,9 +323,28 @@ class HeadsetServer:
         done = asyncio.get_running_loop().create_future()
         self._scene_request = (name, done)
         self._scene_changed.set()
+        self._next_block_due_s = None
+        self._generation_wakeup.set()
         if self.source is not None:
             self.source.request_restart()
         await asyncio.shield(done)
+
+    async def _wait_for_generation_slot(self, track: MjpegFrames) -> None:
+        """Capture controls closer to the next MJPEG block's display deadline."""
+        if not self.generation_lead_ms or self.token_emitter is not None:
+            return
+        # Give the newly scheduled publisher a turn to estimate its next block.
+        await asyncio.sleep(0)
+        self._generation_wakeup.clear()
+        if (self._next_block_due_s is None or self.track is not track
+                or not self._ready.is_set() or self._scene_request is not None):
+            return
+        delay = self._next_block_due_s - self.generation_lead_ms / 1000 - time.perf_counter()
+        if delay > 0:
+            try:
+                await asyncio.wait_for(self._generation_wakeup.wait(), timeout=delay)
+            except TimeoutError:
+                pass
 
     async def _generate(self) -> None:
         playback: asyncio.Task[None] | None = None
@@ -304,6 +376,7 @@ class HeadsetServer:
                             self._jpeg_version += 1
                             self._jpeg_changed.notify_all()
                         self._last_publish_s = None
+                        self._next_block_due_s = None
                         done.set_result(None)
                     finally:
                         if not done.done():
@@ -332,6 +405,7 @@ class HeadsetServer:
                     self._ready.clear()
                     continue
                 if self.restart_requested:
+                    self._next_block_due_s = None
                     await self._run_inference(self.session.reset)
                     self.restart_requested = False
                 requirements = self.session.next_step_requirements()
@@ -339,6 +413,7 @@ class HeadsetServer:
                     if playback is not None:
                         await playback
                         playback = None
+                    await self._wait_for_cache_refresh()
                     if self.token_descriptor is None:
                         return
                     await self._run_inference(self.session.reset)
@@ -362,6 +437,10 @@ class HeadsetServer:
                         end_s=requirements.input_frame_count / self.session.config.fps,
                     )
                 )
+                await self._wait_for_generation_slot(track)
+                if (self.track is not track or not self._ready.is_set()
+                        or self._scene_request is not None or self.restart_requested):
+                    continue
                 cycle_started = time.perf_counter()
                 try:
                     if emitter is None:
@@ -380,6 +459,7 @@ class HeadsetServer:
                         await playback
                     playback = None
                     self._last_publish_s = None
+                    self._next_block_due_s = None
                 if self.track is track and self._ready.is_set():
                     if emitter is not None and result.layout is None:
                         for latent in result.output.split(1):
@@ -394,6 +474,8 @@ class HeadsetServer:
                     frames = await self._run_inference(
                         track.prepare_result_frames, result
                     )
+                    if self.defer_cache_refresh:
+                        self._queue_cache_refresh()
                     if self._scene_request is not None:
                         continue
                     prepared = time.perf_counter()
@@ -460,6 +542,15 @@ class HeadsetServer:
     ) -> None:
         """Publish one block in order, pacing frames at the display rate."""
         playback_started = time.perf_counter()
+        if self.generation_lead_ms:
+            first_due = max(
+                playback_started,
+                self._last_publish_s + 1 / self.display_fps
+                if self._last_publish_s is not None else playback_started,
+            )
+            # ponytail: the lead is calibrated for the deployment's measured
+            # compute time; future adaptive scheduling must retain a margin.
+            self._next_block_due_s = first_due + len(frames) / self.display_fps
         jpeg_s = 0.0
         boundary_s = None
         pose_age = "n/a"
@@ -622,6 +713,8 @@ def create_app(manager: HeadsetServer) -> web.Application:
                             break
                         if manager.source is not None:
                             manager.source.request_restart()
+                        manager._next_block_due_s = None
+                        manager._generation_wakeup.set()
                     else:
                         manager.frames.push(payload)
                 except (ValueError, TypeError, KeyError):
@@ -779,6 +872,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--display-fps", type=int, default=30)
     parser.add_argument("--print-actions", action="store_true")
     parser.add_argument(
+        "--generation-lead-ms", type=float, default=0.0,
+        help="MJPEG generation lead before the next block is due; 0 disables deferral",
+    )
+    parser.add_argument(
         "--deadline-pacing",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -819,6 +916,10 @@ def main(argv: list[str] | None = None) -> None:
         not math.isfinite(network.headset_input_fps) or network.headset_input_fps <= 0
     ):
         parser.error("--headset-input-fps must be finite and positive")
+    if not math.isfinite(network.generation_lead_ms) or network.generation_lead_ms < 0:
+        parser.error("--generation-lead-ms must be finite and nonnegative")
+    if network.generation_lead_ms and not (network.deadline_pacing and network.overlap_playback):
+        parser.error("--generation-lead-ms requires --deadline-pacing and --overlap-playback")
     application = Cosmos3HDreamsApplication()
     model_defaults = (
         ["--config", network.config]
@@ -867,6 +968,7 @@ def main(argv: list[str] | None = None) -> None:
         deadline_pacing=network.deadline_pacing,
         gpu_frame_conversion=network.gpu_frame_conversion,
         dedicated_inference_thread=network.dedicated_inference_thread,
+        generation_lead_ms=network.generation_lead_ms,
         scenes=application.scenes,
         scene_labels=application.scene_labels,
     )
@@ -884,7 +986,8 @@ def main(argv: list[str] | None = None) -> None:
         f"video presentation: {network.display_fps} fps; "
         f"overlap playback: {network.overlap_playback}; "
         f"deadline pacing: {network.deadline_pacing}; "
-        f"GPU frame conversion: {network.gpu_frame_conversion}"
+        f"GPU frame conversion: {network.gpu_frame_conversion}; "
+        f"MJPEG generation lead: {network.generation_lead_ms:g} ms (0 disables)"
     )
     print(f"Open https://<workstation-LAN-IP>:{network.port}/headset in the headset browser")
     print(f"Open https://<workstation-LAN-IP>:{network.port}/viewer on a PC")

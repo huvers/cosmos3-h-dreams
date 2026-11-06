@@ -141,6 +141,25 @@ class Cosmos3HDreamsApplication(IFlashDreamsApplication):
             default=False,
         )
         parser.add_argument(
+            "--defer-cache-refresh",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Experimental: defer FadeMem refresh until pixels are prepared. Default off.",
+        )
+        parser.add_argument(
+            "--reuse-cache-rope",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Experimental: reuse positional factors across FadeMem layers. Default off.",
+        )
+        parser.add_argument(
+            "--compile-cache-refresh",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Experimental: compile saturated FadeMem refresh layers; requires "
+            "CUDA and --compile-denoise. May change rollout numerics. Default off.",
+        )
+        parser.add_argument(
             "--compile-denoise", action=argparse.BooleanOptionalAction, default=False
         )
         parser.add_argument(

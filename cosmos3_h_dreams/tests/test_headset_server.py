@@ -899,7 +899,8 @@ def test_gpu_frame_conversion_keeps_cpu_fallback():
     np.testing.assert_array_equal(candidate, baseline)
 
 
-def test_dedicated_worker_preserves_context_and_serializes_shutdown():
+@pytest.mark.parametrize("deferred", [False, True])
+def test_dedicated_worker_preserves_context_and_serializes_shutdown(deferred):
     """Exercise actual init, scene switch, generation, conversion and cancellation."""
     context = contextvars.ContextVar("inference_test_context", default=None)
     calls = []
@@ -925,12 +926,13 @@ def test_dedicated_worker_preserves_context_and_serializes_shutdown():
         context.set("request-context")
         manager = HeadsetServer(
             session=SimpleNamespace(
-                config=SimpleNamespace(fps=10, profile=False),
+                config=SimpleNamespace(fps=10, profile=False, defer_cache_refresh=deferred),
                 init=lambda: record("init"),
                 switch_scene=lambda _: record("switch"),
                 next_step_requirements=lambda: SimpleNamespace(input_frame_count=1),
                 step=step,
                 close=lambda: record("close"),
+                submit_pending_cache_update=lambda: record("refresh"),
             ),
             frames=LatestHeadsetFrames(fps=30),
             dedicated_inference_thread=True,
@@ -958,7 +960,8 @@ def test_dedicated_worker_preserves_context_and_serializes_shutdown():
             await asyncio.wait_for(closing, timeout=2)
             await manager.close()
             names = [name for name, _, _ in calls]
-            assert names == ["init", "switch", "step", "prepare", "step", "step_finished", "close"]
+            assert names == ["init", "switch", "step", "prepare",
+                             *(["refresh"] if deferred else []), "step", "step_finished", "close"]
             workers = {worker for _, worker, _ in calls}
             assert len(workers) == 1 and threading.get_ident() not in workers
             assert all(value == "request-context" for _, _, value in calls)
@@ -966,4 +969,76 @@ def test_dedicated_worker_preserves_context_and_serializes_shutdown():
             release.set()
             await manager.close()
 
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("options", [
+    {"generation_lead_ms": -1}, {"generation_lead_ms": float("nan")},
+    {"generation_lead_ms": float("inf")}, {"generation_lead_ms": 180},
+    {"generation_lead_ms": 180, "deadline_pacing": True, "overlap_playback": False},
+])
+def test_generation_lead_rejects_invalid_configuration(options):
+    with pytest.raises(ValueError, match="generation_lead_ms"):
+        HeadsetServer(session=SimpleNamespace(), frames=LatestHeadsetFrames(fps=30), **options)
+
+
+def test_generation_wait_defers_and_wakes_on_reset_or_cancellation():
+    async def check():
+        manager = HeadsetServer(session=SimpleNamespace(), frames=LatestHeadsetFrames(fps=30),
+                                deadline_pacing=True, generation_lead_ms=30)
+        track = object()
+        manager.track = track
+        manager._ready.set()
+        manager._next_block_due_s = server_module.time.perf_counter() + .10
+        started = server_module.time.perf_counter()
+        await manager._wait_for_generation_slot(track)
+        assert server_module.time.perf_counter() - started >= .055
+        manager._next_block_due_s = server_module.time.perf_counter() + 10
+        waiting = asyncio.create_task(manager._wait_for_generation_slot(track))
+        await asyncio.sleep(.01)
+        await manager.reset_video()
+        await asyncio.wait_for(waiting, .2)
+        assert manager._next_block_due_s is None
+        manager.track = track
+        manager._ready.set()
+        manager._next_block_due_s = server_module.time.perf_counter() + 10
+        waiting = asyncio.create_task(manager._wait_for_generation_slot(track))
+        await asyncio.sleep(.01)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        # Token delivery has its own flow control and must not be deferred.
+        manager.token_emitter = object()
+        await asyncio.wait_for(manager._wait_for_generation_slot(track), .1)
+    asyncio.run(check())
+
+
+def test_disconnect_during_scheduling_wait_does_not_submit_inference(monkeypatch):
+    async def check():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        steps = []
+        manager = HeadsetServer(
+            session=SimpleNamespace(config=SimpleNamespace(fps=10),
+                next_step_requirements=lambda: SimpleNamespace(input_frame_count=8),
+                step=lambda window: steps.append(window)),
+            frames=LatestHeadsetFrames(fps=30), deadline_pacing=True, generation_lead_ms=180,
+        )
+        manager.socket = object()
+        manager.track = object()
+        manager._ready.set()
+        async def wait(track):
+            entered.set()
+            await release.wait()
+        monkeypatch.setattr(manager, "_wait_for_generation_slot", wait)
+        producer = asyncio.create_task(manager._generate())
+        try:
+            await asyncio.wait_for(entered.wait(), .5)
+            await manager.reset_video()
+            release.set()
+            await asyncio.sleep(.02)
+            assert not steps
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
     asyncio.run(check())

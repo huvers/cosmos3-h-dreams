@@ -13,7 +13,9 @@ The native headset/WebXR entry point remains available.
 Status: **useful opt-in on the tested H100/Chromium stack**. RTX PRO 6000 is a
 validation target, not a GPU on which these numbers have been reproduced.
 No model weights, attention/cache semantics, or shared `flashdreams/` code were
-changed by our optimization patch. The inherited token fork has its own
+changed by our optimization patch. The optional compiled cache refresh described
+below changes floating-point numerics and can change later rollout content and
+cache merge selections. The inherited token fork has its own
 [provenance](../TOKEN_DEMO.md#provenance).
 
 ## Quick start: keyboard, no headset required
@@ -25,7 +27,7 @@ workspace defaults to CUDA 13. Supply the public two-step BF16 checkpoint from
 The source fork does not redistribute downloaded weights or decoder exports.
 
 ```bash
-git clone --branch codex/steady8-keyboard --single-branch \
+git clone --branch codex/eight-frame-scheduling --single-branch \
   https://github.com/huvers/cosmos3-h-dreams.git
 cd cosmos3-h-dreams
 uv sync --package flashdreams-cosmos3-h-dreams --extra token-stream --locked
@@ -101,6 +103,255 @@ The first, second and fourth changes remain opt-in. Their inverse flags are
 header fix. Defaults otherwise retain the fork’s original presentation behavior.
 The documented command enables the combination exercised by the H100 harness.
 
+## Optional eight-frame scheduling
+
+On the keyboard **Pixel** path, add `--generation-lead-ms 180` to the command
+above to try the H100 scheduling setting. `--generation-lead-ms 0` disables
+scheduling deferral. The default is zero; deadline pacing and overlapping
+playback are required. The same option is accepted by the headset CLI and as
+`headset.generation_lead_ms` in session YAML. Raw Tokens uses its own flow control
+and bypasses this option. Headset pose acquisition has not been benchmarked with
+this setting.
+
+The scheduler waits before capturing controls and generating the next block,
+leaving the requested lead time before its predicted presentation deadline.
+It retains eight-frame generation and ordered playback. Disconnects, resets and
+scene requests invalidate the deadline; cancellation interrupts the wait.
+
+**Calibrate the lead for the actual GPU and workload.** A smaller lead captures
+newer controls but can starve playback if inference takes longer. Start with
+scheduling disabled, measure high-percentile input acquisition plus generation,
+decode and frame preparation time, and leave a margin for variation and JPEG
+encoding. If that work consumes the whole eight-frame display budget (267 ms at
+30 fps), scheduling has little spare time to reclaim. The 180 ms H100 setting
+is not a measured RTX PRO 6000 recommendation.
+
+Prototype results on H100/Chromium, with eight frames and 30 fps in every case:
+
+| Keyboard path | Median control-to-browser | P95 |
+| --- | ---: | ---: |
+| Current scheduling | 451.5 ms | 566.4 ms |
+| 180 ms generation lead | 333.0 ms | 450.5 ms |
+| Controlled delayed link, current | 513.4 ms | 636.5 ms |
+| Controlled delayed link, 180 ms lead | 406.2 ms | 522.5 ms |
+
+Local trials used baseline/candidate/candidate/baseline order, 45 seconds each,
+with seconds 10–42 measured: 64 control changes per path, all consumed and
+observed. There were no missing intermediate frame IDs or gaps over 100 ms in
+any selected window. FPS was about 29.5. The paired delayed-link trials used
+25 ms each direction, deterministic ±10 ms variation, 20 Mbps down/1 Mbps up.
+The local median reduction was **118.5 ms / 26.3%**. Prepared-block waiting fell
+from 129.4 to 7.3 ms; inference and preparation remained about 142 ms.
+
+All 512 full-resolution fixed-replay frames matched pixel-for-pixel across the
+prototype paths, including cache boundaries; both resets exactly reproduced
+the opening eight frames. These are software keyboard-to-decoded-image timing
+and fixed-replay checks, not optical display or semantic motion-onset results.
+Do not add these savings to earlier experiments or compare their absolute times
+to the Mac/VPN or headset pose-sampler results.
+
+## Experimental compiled cache refresh (default off)
+
+Add `--compile-cache-refresh` to the keyboard command above to compile the
+stateless per-layer cache-refresh computation **only after FadeMem fills**.
+Use `--no-compile-cache-refresh` to return to eager refresh. Every preset leaves
+this option disabled. Headset and action-replay commands accept the same flag;
+session YAML can set `runtime.compile_cache_refresh: true` and the CLI opt-out
+overrides it. CUDA, FadeMem and `--compile-denoise` are required. Compilation
+runs during the existing hidden startup warmup; allow extra startup time on a
+new GPU/compiler cache. Compiler errors remain visible; restart with the flag
+disabled if the target stack cannot compile this path.
+
+Status: **Useful opt-in for experimental evaluation on the tested H100 stack**.
+It preserves eight output frames, two denoising steps, weights, decoder and cache
+policy. Cache filling, positional setup, cache append/merge and side-stream
+ordering remain eager. It is model-side and can be used with Pixel or Raw Tokens;
+browser decoding and network costs are separate. No preset enables it implicitly.
+
+An isolated H100 trial measured **137.70 → 122.09 ms per eight frames**, a
+**15.61 ms / 11.34%** median reduction, over 32 timed chunks after eight warmup
+chunks. Timing ended at prepared host uint8 RGB, not screen presentation. The
+tested stack was H100 80 GB, Python 3.12.3, PyTorch 2.11.0+cu130, CUDA 13.0 and
+cuDNN 91900, with the preset in the keyboard command above and persistent
+compiler caching enabled. These numbers came from the pre-integration experiment, not RTX
+PRO 6000. The eager per-layer CUDA-graph alternative was slower and is not shipped.
+
+**Numerical differences are expected.** In six matched one-minute pairs (seeds
+0/1/7, repeated reversals and abrupt recorded-control changes; 21,600 generated
+frames), all outputs were finite and all 12 within-mode opening-eight reset
+checks were exact. There were no predefined temporal/freeze/black-frame/detail
+review alerts. Candidate/baseline temporal p95 ratios were 0.961–1.028 and
+late-quarter sharpness ratios 0.973–1.010. Sampled images were broadly similar,
+with later tool-position and edge differences; some later cache merges differed.
+This does not establish full-video perceptual equivalence, hallucination rate,
+or semantic control accuracy. Compare longer rollouts on the target GPU.
+
+The integrated option passed **151 product CPU tests**, two dependency-policy
+checks and the browser JavaScript checks. On Eos H100, all 512 frames with the
+option disabled matched the eager experimental reference, and all 512 enabled
+frames matched the compiled experimental reference. Both modes passed finite,
+reset and scene-return checks. The enabled replay made 2,088 compiled layer
+calls after saturation; the disabled replay made zero. Validation used separate
+concurrent GPUs, so its timings are diagnostic rather than a new isolated speed
+comparison. Source tested: `c49da803b5371849ed9940e824e4b8c71c5b7ec9`.
+
+The product includes a bounded manual CUDA probe. From the repository root,
+run these sequentially on an otherwise idle GPU, in fresh processes:
+
+```bash
+.venv/bin/python -m cosmos3_h_dreams.cache_refresh_probe \
+  --checkpoint /path/to/c3-h-d_2-step_model_bf16.safetensors \
+  --mode eager --output /tmp/dreams-cache-eager
+.venv/bin/python -m cosmos3_h_dreams.cache_refresh_probe \
+  --checkpoint /path/to/c3-h-d_2-step_model_bf16.safetensors \
+  --mode compiled --output /tmp/dreams-cache-compiled
+```
+
+Each output directory must be new. `quality.json` records the commit, command,
+stack/configuration, startup, 32 raw timings and p50/p90/p95, peak allocator memory,
+512 full-resolution frame hashes, finite outputs, reset and scene-return checks.
+`--frames 1800 --seed 7` extends the repeated-motion replay. Record whether the
+persistent compiler cache was cold or warm. `--reference-quality` accepts a
+**same-mode, same-stack** JSON to check integration reproducibility; do not use
+the eager JSON as an exact-pixel quality gate for compiled mode. This probe does
+not measure browser timing or save comparison videos.
+
+Recalibrate `--generation-lead-ms` after changing generation speed. Do not add
+the cache-generation saving directly to the scheduler's control-to-browser
+saving. Neither 180 ms lead nor the 11.34% improvement is an RTX PRO 6000 promise.
+
+### Lead recalibration with compiled refresh
+
+With `--compile-cache-refresh` enabled, a matched H100/Chromium trial supports
+`--generation-lead-ms 160` as a useful opt-in for the keyboard Pixel path.
+Four fresh-process, 45-second trials ran in 180/160/160/180 ms order, with
+seconds 10–42 measured: 64 control transitions per setting, all consumed and
+observed. The default remains 0 (disabled).
+
+| Lead with compiled refresh | Median control-to-browser | P95 |
+| --- | ---: | ---: |
+| 180 ms | 332.75 ms | 451.46 ms |
+| 160 ms | 317.60 ms | 431.36 ms |
+
+The median saving was **15.15 ms / 4.55%**. Both paths sustained approximately
+29.5 fps with no missing intermediate frame IDs and no gaps above 100 ms in the
+measured windows. A 512-frame replay at 160 ms reproduced the published compiled
+reference exactly, including reset. This is a scheduling gain, not additional
+generation acceleration. Generation plus frame preparation remained about
+123–124 ms. These are Eos-local software browser timings; RTX PRO 6000, actual
+network/client and headset input acquisition need their own lead calibration.
+
+### Experimental reuse of cache positional factors (default off)
+
+Add `--reuse-cache-rope` to compute the temporal sine/cosine tensors once per
+cache prepare/commit operation and reuse them across layers. Use
+`--no-reuse-cache-rope` to disable it. Session YAML accepts
+`runtime.reuse_cache_rope: true`; every preset leaves it off. FadeMem is required.
+The transformation arithmetic, keys/values, cache validation, merge decisions
+and buffer movement remain unchanged. Factors are local to one operation and
+are recomputed after position or history changes.
+
+Status: **Useful opt-in on the measured H100 stack**. With per-layer compiled
+refresh enabled in both modes, 32 timed chunks after eight warmup chunks gave
+**121.33 → 117.77 ms per eight frames**, saving **3.56 ms / 2.93%** through
+prepared uint8 RGB. The 72 temporal-factor computations per chunk fell to two.
+All 512 moving and 128 static frames, cache merge schedules, reset and scene
+return matched exactly. Peak allocated VRAM stayed at 36.58 GiB. This preserves
+the published compiled path's output on the tested replay; its existing
+numerical differences from eager refresh still apply.
+
+Integrated validation passed 159 product CPU tests and a separate H100 run of
+the packaged option both off and on. Each mode produced 512 finite frames,
+matching every published compiled-reference frame hash and each other exactly;
+reset and scene return reproduced the opening eight frames. The probe verified
+the active option in the actual FadeMem adapter. These two integration processes
+used separate GPUs concurrently; their timings are diagnostic, not additional
+isolated performance evidence.
+
+The manual probe above accepts `--reuse-cache-rope` for target-GPU evaluation.
+The browser lead comparison used compiled refresh without positional reuse;
+it does not establish extra browser-latency savings from this second option.
+
+Compiling all 36 stateless refresh layers together was also tested. It saved
+only **0.99 ms / 0.82%** (121.33 → 120.33 ms) and introduced further numerical
+differences after frame 56. Adding it to positional reuse yielded 117.36 ms,
+only 0.42 ms faster than reuse alone. Both missed the predeclared whole-pass
+speed gate of 5 ms and 4%, so whole-pass compilation is **Rejected** and is not
+part of the product. Finite, reset and scene-return checks passed; numerical
+drift by itself is not a semantic quality failure.
+
+### Experimental deferred cache refresh (default off)
+
+Add `--defer-cache-refresh` to prepare pixels before submitting the next history
+cache refresh. The MJPEG server queues that refresh on the **existing dedicated
+inference worker** while playback continues. It joins the work before subsequent
+inference, reset, scene switching or cleanup. There is no additional model thread.
+Cache arithmetic, validation, merge policy and eight-frame generation are retained.
+
+Use `--no-defer-cache-refresh` to disable it. Session YAML accepts
+`runtime.defer_cache_refresh: true`; every preset leaves it off. It requires
+CUDA, FadeMem and `--overlap-cache-update`. Browser use additionally requires
+`--dedicated-inference-thread`. The documented compiled FadeMem preset already
+enables cache-update overlap. The option is independent of compilation, but the
+measured combination also enables compiled cache refresh and positional reuse.
+
+For the measured H100 combination, add these options to the optimized keyboard
+command near the top of this document:
+
+```bash
+--compile-cache-refresh --reuse-cache-rope \
+--defer-cache-refresh --generation-lead-ms 120
+```
+
+**Recalibrate after disabling deferral.** Keeping a shorter lead while restoring
+synchronous refresh can starve playback. Use `--generation-lead-ms 0` while
+calibrating; 160 ms was the earlier H100 setting with compiled refresh. Neither
+120 nor 160 ms is a measured RTX PRO 6000 recommendation.
+
+The H100 prototype passed four fresh-process 35-second browser trials in
+baseline/candidate/candidate/baseline order, seconds 10–32 measured and 44 control
+transitions per setting. Baseline used a 160 ms lead; deferral used 120 ms:
+
+| Software control-to-browser | Baseline | Deferred refresh |
+| --- | ---: | ---: |
+| Median | 317.70 ms | 281.50 ms |
+| P95 | 436.00 ms | 398.00 ms |
+
+The median saving was **36.20 ms / 11.39%**. All controls were consumed and
+observed, no intermediate frame IDs were missing, and there were no gaps over
+100 ms in the measured windows. Observed playback was about 29.5 fps. This is a
+combined delivery/scheduling gain; a fixed-lead comparison was not run.
+
+A separate matched pilot made prepared RGB available in **118.49 → 69.36 ms**,
+while complete throughput, including all cache work, stayed essentially unchanged
+at **67.50 → 68.16 fps**. The earlier readiness is not 49 ms less GPU computation.
+All 512 moving plus 128 static frames and cache-entry schedules matched exactly,
+including reset, scene return, and pending-work lifecycle checks. A further
+512-frame replay through actual paced presentation matched the compiled reference
+exactly, including reset. Additional-CPU-thread variants lost 8.67–14.97% throughput
+and were rejected; they are not included in this implementation.
+
+Raw Tokens submits refresh synchronously before returning its latent output;
+the deferred delivery benefit is validated for MJPEG pixels only. Standalone
+session consumers may call `submit_pending_cache_update()` on the inference owner
+after pixel preparation. The next step, reset and close also drain retained work.
+The manual CUDA probe accepts `--defer-cache-refresh` and reports frame-readiness
+timings separately from complete cache-drained throughput. Synchronized stage
+profiling drains refresh inside the step and does not measure this delivery gain.
+
+The packaged implementation passed **172 product CPU tests** on Eos.
+Fresh off/on processes each reproduced all 512 compiled-reference frames exactly;
+reset, scene return, pending-work reset/close and synchronous Raw Tokens fallback
+passed. Raw latent hashes matched. A further 512-frame paced product replay and
+its reset also matched exactly. Tested source: `b89475cfc85468c04bdd2efeda310feae1b00d6c`.
+
+A separate integrated browser check (one 35-second trial per mode, seconds 10–32,
+22 measured controls per mode) gave median **316.05 → 281.25 ms** and
+p95 **432.69 → 388.59 ms**, using 160/120 ms leads. All controls were
+observed, with no missing frame IDs or gaps over 100 ms. This confirms the packaged
+path; the four-trial prototype above remains the primary performance comparison.
+Concurrent GPU integration-probe timings are diagnostic, not an isolated benchmark.
+
 ## Evidence and limits
 
 These are short software-timing experiments, not optical display/physical
@@ -152,7 +403,19 @@ limits of MAE ≤3 and PSNR ≥32 dB. Longer latent-rollout quality remains unva
 If the browser decoder runs on RTX instead of Apple hardware, repeat this test;
 the Apple result does not establish which transport wins there.
 
-### Validation scope of this public branch
+### Integrated scheduling validation
+
+The integrated server option passed 74 CPU tests, the browser JavaScript checks,
+and a separate H100/browser rerun. A matched pair of 45-second local keyboard
+trials (32 measured state changes per path) gave median **454.5 → 337.8 ms** and
+p95 **562.4 → 447.0 ms**, with zero missing frame IDs and zero gaps over 100 ms
+in seconds 10–42. The integrated 512-frame fixed replay matched the original
+baseline pixel-for-pixel; reset reproduced the first eight frames exactly.
+This confirms the product scheduler path; the launchers' option wiring was
+covered by CPU tests. RTX PRO 6000 and headset motion-to-screen timing remain
+unmeasured.
+
+### Earlier validation of the baseline branch
 
 The merged server implementation passed the live H100/browser experiment. This
 publication adds CLI wiring for the same server options and a headset YAML
